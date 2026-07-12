@@ -5,9 +5,6 @@ from datetime import datetime
 from telethon import TelegramClient, events, Button
 from telethon.tl.functions.account import GetAuthorizationsRequest, ResetAuthorizationRequest
 from telethon.errors import SessionPasswordNeededError
-from flask import Flask, request, jsonify
-import threading
-import time
 
 # Environment variables
 API_ID = int(os.getenv('API_ID', '2040'))
@@ -21,20 +18,14 @@ c = conn.cursor()
 c.execute('CREATE TABLE IF NOT EXISTS accounts (phone TEXT PRIMARY KEY, session_name TEXT)')
 conn.commit()
 
-app = Flask(__name__)
-bot = None
+bot = TelegramClient('bot', API_ID, API_HASH)
 clients = {}
-connecting = set()
 
 def is_admin(user_id):
     return user_id in ADMIN_IDS
 
 async def start_account(phone, session_name):
     """Start account with flood protection"""
-    if phone in connecting:
-        return False
-    
-    connecting.add(phone)
     try:
         client = TelegramClient(f'sessions/{session_name}', API_ID, API_HASH)
         await client.connect()
@@ -53,7 +44,7 @@ async def start_account(phone, session_name):
                             f'⚠️ НОВАЯ СЕССИЯ!\n\n📞 {phone}\n📱 {auth.device_model}\n💻 {auth.platform}\n🌐 {auth.ip}\n📍 {auth.country}\n🕐 {datetime.fromtimestamp(auth.date_created).strftime("%d.%m.%Y %H:%M")}',
                             buttons=[[
                                 Button.inline("🚫 КИНУТЬ", f"kick_{phone}_{auth.hash}"),
-                                Button.inline("✅ МОЁ", f"keep_{phone}")
+                                Button.inline("✅ МОЇ", f"keep_{phone}")
                             ]]
                         )
             except Exception as e:
@@ -63,174 +54,92 @@ async def start_account(phone, session_name):
     except Exception as e:
         print(f'❌ {phone}: {e}')
         return False
-    finally:
-        connecting.discard(phone)
 
-@app.route('/health', methods=['GET'])
-def health():
-    return jsonify({'status': 'ok', 'accounts': len(clients)}), 200
+@bot.on(events.NewMessage(pattern='/start'))
+async def start_cmd(event):
+    print(f'📨 /start от {event.sender_id}')
+    if not is_admin(event.sender_id):
+        return await event.reply('⛔ НЕТ ДОСТУПА')
+    await event.reply('🤖 БОТ ГОТОВ', buttons=[
+        [Button.inline('📋 СПИСОК', 'list')],
+        [Button.inline('🔄 РЕСТАРТ', 'restart')]
+    ])
 
-@app.route('/accounts', methods=['GET'])
-def get_accounts():
+@bot.on(events.CallbackQuery(data='list'))
+async def list_acc(event):
+    if not is_admin(event.sender_id):
+        return await event.answer('НЕТ ДОСТУПА', alert=True)
+    
     c.execute('SELECT phone FROM accounts')
     accs = c.fetchall()
-    accounts = []
+    if not accs:
+        return await event.edit('📭 ПУСТО')
+    
+    msg = '📋 АККАУНТЫ:\n\n'
     for phone in accs:
-        status = 'online' if phone[0] in clients else 'offline'
-        accounts.append({'phone': phone[0], 'status': status})
-    return jsonify(accounts), 200
+        status = '🟢' if phone[0] in clients else '🔴'
+        msg += f'{status} {phone[0]}\n'
+    await event.edit(msg)
 
-@app.route('/accounts', methods=['POST'])
-def add_account():
-    data = request.get_json()
-    phone = data.get('phone')
+@bot.on(events.CallbackQuery(data='restart'))
+async def restart_acc(event):
+    if not is_admin(event.sender_id):
+        return await event.answer('НЕТ ДОСТУПА', alert=True)
     
-    if not phone or not phone.startswith('+'):
-        return jsonify({'error': 'Invalid phone format'}), 400
-    
-    try:
-        session = phone.replace('+', '')
-        c.execute('INSERT OR REPLACE INTO accounts VALUES (?, ?)', (phone, session))
-        conn.commit()
-        
-        # Start account in background
-        asyncio.create_task(start_account(phone, session))
-        
-        return jsonify({'status': 'added', 'phone': phone}), 201
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/accounts/<phone>', methods=['DELETE'])
-def delete_account(phone):
-    try:
-        c.execute('DELETE FROM accounts WHERE phone = ?', (phone,))
-        conn.commit()
-        if phone in clients:
-            asyncio.create_task(clients[phone].disconnect())
-            del clients[phone]
-        return jsonify({'status': 'deleted'}), 200
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-async def init_bot():
-    """Initialize Telegram bot"""
-    global bot
-    try:
-        bot = TelegramClient('bot', API_ID, API_HASH)
-        await bot.start(bot_token=BOT_TOKEN)
-        print('🤖 БОТ ИНИЦИАЛИЗИРОВАН')
-    except Exception as e:
-        print(f'❌ Ошибка инициализации бота: {e}')
-        return
-    
-    @bot.on(events.NewMessage(pattern='/start'))
-    async def start_cmd(event):
-        if not is_admin(event.sender_id):
-            return await event.reply('⛔ НЕТ ДОСТУПА')
-        await event.reply('🤖 БОТ ГОТОВ', buttons=[
-            [Button.inline('📋 СПИСОК', 'list')],
-            [Button.inline('🔄 РЕСТАРТ', 'restart')]
-        ])
-
-    @bot.on(events.CallbackQuery(data='list'))
-    async def list_acc(event):
-        if not is_admin(event.sender_id):
-            return await event.answer('НЕТ ДОСТУПА', alert=True)
-        
-        c.execute('SELECT phone FROM accounts')
-        accs = c.fetchall()
-        if not accs:
-            return await event.edit('📭 ПУСТО')
-        
-        msg = '📋 АККАУНТЫ:\n\n'
-        for phone in accs:
-            status = '🟢' if phone[0] in clients else '🔴'
-            msg += f'{status} {phone[0]}\n'
-        await event.edit(msg)
-
-    @bot.on(events.CallbackQuery(data='restart'))
-    async def restart_acc(event):
-        if not is_admin(event.sender_id):
-            return await event.answer('НЕТ ДОСТУПА', alert=True)
-        
-        await event.edit('🔄 ПЕРЕЗАПУСК...')
-        for phone, client in list(clients.items()):
-            try:
-                await client.disconnect()
-            except:
-                pass
-        clients.clear()
-        
-        c.execute('SELECT phone, session_name FROM accounts')
-        for idx, (phone, session) in enumerate(c.fetchall()):
-            # Add delay between reconnections to avoid flood
-            await asyncio.sleep(2 + idx * 1)
-            await start_account(phone, session)
-        
-        await event.edit('✅ ПЕРЕЗАПУЩЕНО')
-
-    @bot.on(events.CallbackQuery(data=lambda x: x and x.startswith('kick_')))
-    async def kick(event):
+    await event.edit('🔄 ПЕРЕЗАПУСК...')
+    for phone, client in list(clients.items()):
         try:
-            parts = event.data.decode().split('_')
-            if len(parts) >= 3:
-                phone = parts[1]
-                hash_str = parts[2]
-                if phone in clients:
-                    auths = await clients[phone](GetAuthorizationsRequest())
-                    for auth in auths.authorizations:
-                        if str(auth.hash) == hash_str:
-                            await clients[phone](ResetAuthorizationRequest(hash=int(hash_str)))
-                            await event.edit('✅ СЕССИЯ КИНУТА')
-                            break
-        except Exception as e:
-            print(f'Кик ошибка: {e}')
-
-    @bot.on(events.CallbackQuery(data=lambda x: x and x.startswith('keep_')))
-    async def keep(event):
-        await event.edit('✅ ОСТАВЛЕНО')
-
-async def run_bot():
-    """Main bot loop"""
-    await init_bot()
+            await client.disconnect()
+        except:
+            pass
+    clients.clear()
     
-    # Load and start all accounts with delays
+    c.execute('SELECT phone, session_name FROM accounts')
+    for idx, (phone, session) in enumerate(c.fetchall()):
+        await asyncio.sleep(10 + idx * 5)
+        await start_account(phone, session)
+    
+    await event.edit('✅ ПЕРЕЗАПУщЕНО')
+
+@bot.on(events.CallbackQuery(data=lambda x: x and x.startswith('kick_')))
+async def kick(event):
+    try:
+        parts = event.data.decode().split('_')
+        if len(parts) >= 3:
+            phone = parts[1]
+            hash_str = parts[2]
+            if phone in clients:
+                auths = await clients[phone](GetAuthorizationsRequest())
+                for auth in auths.authorizations:
+                    if str(auth.hash) == hash_str:
+                        await clients[phone](ResetAuthorizationRequest(hash=int(hash_str)))
+                        await event.edit('✅ СЕССИЯ КИНУТА')
+                        break
+    except Exception as e:
+        print(f'Кик ошибка: {e}')
+
+@bot.on(events.CallbackQuery(data=lambda x: x and x.startswith('keep_')))
+async def keep(event):
+    await event.edit('✅ ОСТАВЛЕНО')
+
+async def main():
+    print('🚀 ЗАПУСК БОТА...')
+    await bot.start(bot_token=BOT_TOKEN)
+    print('✅ БОТ ПОДКЛЮЧЕН')
+    
+    # Load and start all accounts
     c.execute('SELECT phone, session_name FROM accounts')
     accounts = c.fetchall()
     
+    print(f'⏳ Загружа{len(accounts)} аккаунтов...')
     for idx, (phone, session) in enumerate(accounts):
-        # Add delay between account starts to prevent flooding
-        await asyncio.sleep(3 + idx * 2)
-        try:
-            await start_account(phone, session)
-        except Exception as e:
-            print(f'Error starting {phone}: {e}')
+        delay = 15 + idx * 8
+        print(f'⏳ {phone} через {delay}с...')
+        await asyncio.sleep(delay)
+        await start_account(phone, session)
     
-    print('🚀 ВСЕ АККАУНТЫ ЗАГРУЖЕНЫ')
-    
-    # Keep bot running
-    if bot:
-        await bot.run_until_disconnected()
-
-def start_bot_thread():
-    """Start bot in separate thread"""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(run_bot())
-    except Exception as e:
-        print(f'Bot error: {e}')
-    finally:
-        loop.close()
+    print('🤖 БОТ ГОТОВ К РАБОТЕ')
+    await bot.run_until_disconnected()
 
 if __name__ == '__main__':
-    # Start bot in background thread
-    bot_thread = threading.Thread(target=start_bot_thread, daemon=True)
-    bot_thread.start()
-    
-    # Small delay to let bot start
-    time.sleep(2)
-    
-    # Start Flask app
-    port = int(os.getenv('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+    asyncio.run(main())
