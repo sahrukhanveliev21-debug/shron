@@ -5,20 +5,25 @@ from datetime import datetime
 from telethon import TelegramClient, events, Button
 from telethon.tl.functions.account import GetAuthorizationsRequest, ResetAuthorizationRequest
 from telethon.errors import SessionPasswordNeededError
+from flask import Flask, request, jsonify
+import threading
 
-API_ID = 2040
-API_HASH = 'b18441a1ff607e10a989891a5462e627'
-BOT_TOKEN = '8351363618:AAHmq7zZSZSeLaylwKjfGzgku1DUlVZuekE'
-ADMIN_IDS = [5454585281]
+# Environment variables
+API_ID = int(os.getenv('API_ID', '2040'))
+API_HASH = os.getenv('API_HASH', 'b18441a1ff607e10a989891a5462e627')
+BOT_TOKEN = os.getenv('BOT_TOKEN', '8351363618:AAHmq7zZSZSeLaylwKjfGzgku1DUlVZuekE')
+ADMIN_IDS = list(map(int, os.getenv('ADMIN_IDS', '5454585281').split(',')))
 
 os.makedirs('sessions', exist_ok=True)
-conn = sqlite3.connect('accounts.db')
+conn = sqlite3.connect('accounts.db', check_same_thread=False)
 c = conn.cursor()
 c.execute('CREATE TABLE IF NOT EXISTS accounts (phone TEXT PRIMARY KEY, session_name TEXT)')
 conn.commit()
 
-bot = TelegramClient('bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
+app = Flask(__name__)
+bot = None
 clients = {}
+bot_task = None
 
 def is_admin(user_id):
     return user_id in ADMIN_IDS
@@ -51,142 +56,141 @@ async def start_account(phone, session_name):
         print(f'❌ {phone}: {e}')
         return False
 
-@bot.on(events.NewMessage(pattern='/start'))
-async def start_cmd(event):
-    if not is_admin(event.sender_id):
-        return await event.reply('⛔ НЕТ ДОСТУПА')
-    await event.reply('🤖 БОТ ГОТОВ', buttons=[
-        [Button.inline('➕ ДОБАВИТЬ', 'add')],
-        [Button.inline('📋 СПИСОК', 'list')],
-        [Button.inline('❌ УДАЛИТЬ', 'del')],
-        [Button.inline('🔄 РЕСТАРТ', 'restart')]
-    ])
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({'status': 'ok', 'accounts': len(clients)}), 200
 
-@bot.on(events.CallbackQuery(data='add'))
-async def add_acc(event):
-    if not is_admin(event.sender_id):
-        return await event.answer('НЕТ ДОСТУПА', alert=True)
-    
-    await event.edit('📲 ВВЕДИ НОМЕР:\n+79991234567')
-    
-    async with bot.conversation(event.sender_id) as conv:
-        phone = (await conv.get_response()).text.strip()
-        if not phone.startswith('+'):
-            return await event.reply('❌ НЕВЕРНЫЙ ФОРМАТ')
-        
-        session = phone.replace('+', '')
-        client = TelegramClient(f'sessions/{session}', API_ID, API_HASH)
-        await client.connect()
-        
-        try:
-            await client.send_code_request(phone)
-            await event.reply('📲 ВВЕДИ КОД:')
-            code = (await conv.get_response()).text.strip()
-            
-            try:
-                await client.sign_in(phone, code)
-            except SessionPasswordNeededError:
-                await event.reply('🔐 ВВЕДИ ПАРОЛЬ 2FA:')
-                pwd = (await conv.get_response()).text.strip()
-                await client.sign_in(password=pwd)
-            
-            c.execute('INSERT OR REPLACE INTO accounts VALUES (?, ?)', (phone, session))
-            conn.commit()
-            await start_account(phone, session)
-            await event.reply(f'✅ {phone} ДОБАВЛЕН')
-        except Exception as e:
-            await event.reply(f'❌ {str(e)[:100]}')
-        finally:
-            await client.disconnect()
-
-@bot.on(events.CallbackQuery(data='list'))
-async def list_acc(event):
-    if not is_admin(event.sender_id):
-        return await event.answer('НЕТ ДОСТУПА', alert=True)
-    
+@app.route('/accounts', methods=['GET'])
+def get_accounts():
     c.execute('SELECT phone FROM accounts')
     accs = c.fetchall()
-    if not accs:
-        return await event.edit('📭 ПУСТО')
-    
-    msg = '📋 АККАУНТЫ:\n\n'
+    accounts = []
     for phone in accs:
-        status = '🟢' if phone[0] in clients else '🔴'
-        msg += f'{status} {phone[0]}\n'
-    await event.edit(msg)
+        status = 'online' if phone[0] in clients else 'offline'
+        accounts.append({'phone': phone[0], 'status': status})
+    return jsonify(accounts), 200
 
-@bot.on(events.CallbackQuery(data='del'))
-async def del_acc(event):
-    if not is_admin(event.sender_id):
-        return await event.answer('НЕТ ДОСТУПА', alert=True)
+@app.route('/accounts', methods=['POST'])
+def add_account():
+    data = request.get_json()
+    phone = data.get('phone')
     
-    c.execute('SELECT phone FROM accounts')
-    accs = c.fetchall()
-    if not accs:
-        return await event.edit('📭 ПУСТО')
+    if not phone or not phone.startswith('+'):
+        return jsonify({'error': 'Invalid phone format'}), 400
     
-    buttons = [[Button.inline(p[0], f'del_{p[0]}')] for p in accs]
-    buttons.append([Button.inline('❌ ОТМЕНА', 'cancel')])
-    await event.edit('🗑 ВЫБЕРИ:', buttons=buttons)
-
-@bot.on(events.CallbackQuery(data='restart'))
-async def restart_acc(event):
-    if not is_admin(event.sender_id):
-        return await event.answer('НЕТ ДОСТУПА', alert=True)
-    
-    await event.edit('🔄 ПЕРЕЗАПУСК...')
-    for phone, client in clients.items():
-        try:
-            await client.disconnect()
-        except:
-            pass
-    clients.clear()
-    
-    c.execute('SELECT phone, session_name FROM accounts')
-    for phone, session in c.fetchall():
-        await start_account(phone, session)
-    
-    await event.edit('✅ ПЕРЕЗАПУЩЕНО')
-
-@bot.on(events.CallbackQuery(data=lambda x: x and x.startswith('del_')))
-async def confirm_del(event):
-    phone = event.data.decode().replace('del_', '')
-    c.execute('DELETE FROM accounts WHERE phone = ?', (phone,))
-    conn.commit()
-    if phone in clients:
-        await clients[phone].disconnect()
-        del clients[phone]
-    await event.edit(f'✅ {phone} УДАЛЕН')
-
-@bot.on(events.CallbackQuery(data='cancel'))
-async def cancel(event):
-    await event.edit('❌ ОТМЕНЕНО')
-
-@bot.on(events.CallbackQuery(data=lambda x: x and x.startswith('kick_')))
-async def kick(event):
     try:
-        _, phone, hash_str = event.data.decode().split('_')
-        if phone in clients:
-            auths = await clients[phone](GetAuthorizationsRequest())
-            for auth in auths.authorizations:
-                if str(auth.hash) == hash_str:
-                    await clients[phone](ResetAuthorizationRequest(hash=int(hash_str)))
-                    await event.edit('✅ СЕССИЯ КИНУТА')
-                    break
+        session = phone.replace('+', '')
+        c.execute('INSERT OR REPLACE INTO accounts VALUES (?, ?)', (phone, session))
+        conn.commit()
+        
+        # Start account in background
+        asyncio.create_task(start_account(phone, session))
+        
+        return jsonify({'status': 'added', 'phone': phone}), 201
     except Exception as e:
-        print(f'Кик ошибка: {e}')
+        return jsonify({'error': str(e)}), 500
 
-@bot.on(events.CallbackQuery(data=lambda x: x and x.startswith('keep_')))
-async def keep(event):
-    await event.edit('✅ ОСТАВЛЕНО')
+@app.route('/accounts/<phone>', methods=['DELETE'])
+def delete_account(phone):
+    try:
+        c.execute('DELETE FROM accounts WHERE phone = ?', (phone,))
+        conn.commit()
+        if phone in clients:
+            asyncio.create_task(clients[phone].disconnect())
+            del clients[phone]
+        return jsonify({'status': 'deleted'}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
-async def main():
-    print('🚀 ЗАПУСК БОТА...')
+async def init_bot():
+    global bot
+    bot = TelegramClient('bot', API_ID, API_HASH)
+    await bot.start(bot_token=BOT_TOKEN)
+    
+    @bot.on(events.NewMessage(pattern='/start'))
+    async def start_cmd(event):
+        if not is_admin(event.sender_id):
+            return await event.reply('⛔ НЕТ ДОСТУПА')
+        await event.reply('🤖 БОТ ГОТОВ', buttons=[
+            [Button.inline('📋 СПИСОК', 'list')],
+            [Button.inline('🔄 РЕСТАРТ', 'restart')]
+        ])
+
+    @bot.on(events.CallbackQuery(data='list'))
+    async def list_acc(event):
+        if not is_admin(event.sender_id):
+            return await event.answer('НЕТ ДОСТУПА', alert=True)
+        
+        c.execute('SELECT phone FROM accounts')
+        accs = c.fetchall()
+        if not accs:
+            return await event.edit('📭 ПУСТО')
+        
+        msg = '📋 АККАУНТЫ:\n\n'
+        for phone in accs:
+            status = '🟢' if phone[0] in clients else '🔴'
+            msg += f'{status} {phone[0]}\n'
+        await event.edit(msg)
+
+    @bot.on(events.CallbackQuery(data='restart'))
+    async def restart_acc(event):
+        if not is_admin(event.sender_id):
+            return await event.answer('НЕТ ДОСТУПА', alert=True)
+        
+        await event.edit('🔄 ПЕРЕЗАПУСК...')
+        for phone, client in list(clients.items()):
+            try:
+                await client.disconnect()
+            except:
+                pass
+        clients.clear()
+        
+        c.execute('SELECT phone, session_name FROM accounts')
+        for phone, session in c.fetchall():
+            await start_account(phone, session)
+        
+        await event.edit('✅ ПЕРЕЗАПУЩЕНО')
+
+    @bot.on(events.CallbackQuery(data=lambda x: x and x.startswith('kick_')))
+    async def kick(event):
+        try:
+            parts = event.data.decode().split('_')
+            if len(parts) >= 3:
+                phone = parts[1]
+                hash_str = parts[2]
+                if phone in clients:
+                    auths = await clients[phone](GetAuthorizationsRequest())
+                    for auth in auths.authorizations:
+                        if str(auth.hash) == hash_str:
+                            await clients[phone](ResetAuthorizationRequest(hash=int(hash_str)))
+                            await event.edit('✅ СЕССИЯ КИНУТА')
+                            break
+        except Exception as e:
+            print(f'Кик ошибка: {e}')
+
+    @bot.on(events.CallbackQuery(data=lambda x: x and x.startswith('keep_')))
+    async def keep(event):
+        await event.edit('✅ ОСТАВЛЕНО')
+    
+    print('🤖 БОТ ЗАПУЩЕН')
+
+async def run_bot():
+    await init_bot()
     c.execute('SELECT phone, session_name FROM accounts')
     for phone, session in c.fetchall():
         await start_account(phone, session)
-    print('🤖 БОТ ГОТОВ')
     await bot.run_until_disconnected()
 
+def start_bot_thread():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(run_bot())
+
 if __name__ == '__main__':
-    asyncio.run(main())
+    # Start bot in separate thread
+    bot_thread = threading.Thread(target=start_bot_thread, daemon=True)
+    bot_thread.start()
+    
+    # Start Flask app
+    port = int(os.getenv('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
