@@ -7,6 +7,7 @@ from telethon.tl.functions.account import GetAuthorizationsRequest, ResetAuthori
 from telethon.errors import SessionPasswordNeededError
 from flask import Flask, request, jsonify
 import threading
+import time
 
 # Environment variables
 API_ID = int(os.getenv('API_ID', '2040'))
@@ -23,14 +24,20 @@ conn.commit()
 app = Flask(__name__)
 bot = None
 clients = {}
-bot_task = None
+connecting = set()
 
 def is_admin(user_id):
     return user_id in ADMIN_IDS
 
 async def start_account(phone, session_name):
+    """Start account with flood protection"""
+    if phone in connecting:
+        return False
+    
+    connecting.add(phone)
     try:
         client = TelegramClient(f'sessions/{session_name}', API_ID, API_HASH)
+        await client.connect()
         await client.start(phone=phone)
         clients[phone] = client
         print(f'✅ {phone} запущен')
@@ -50,11 +57,14 @@ async def start_account(phone, session_name):
                             ]]
                         )
             except Exception as e:
-                print(f'Ошибка: {e}')
+                print(f'Ошибка проверки: {e}')
+        
         return True
     except Exception as e:
         print(f'❌ {phone}: {e}')
         return False
+    finally:
+        connecting.discard(phone)
 
 @app.route('/health', methods=['GET'])
 def health():
@@ -103,9 +113,15 @@ def delete_account(phone):
         return jsonify({'error': str(e)}), 500
 
 async def init_bot():
+    """Initialize Telegram bot"""
     global bot
-    bot = TelegramClient('bot', API_ID, API_HASH)
-    await bot.start(bot_token=BOT_TOKEN)
+    try:
+        bot = TelegramClient('bot', API_ID, API_HASH)
+        await bot.start(bot_token=BOT_TOKEN)
+        print('🤖 БОТ ИНИЦИАЛИЗИРОВАН')
+    except Exception as e:
+        print(f'❌ Ошибка инициализации бота: {e}')
+        return
     
     @bot.on(events.NewMessage(pattern='/start'))
     async def start_cmd(event):
@@ -146,7 +162,9 @@ async def init_bot():
         clients.clear()
         
         c.execute('SELECT phone, session_name FROM accounts')
-        for phone, session in c.fetchall():
+        for idx, (phone, session) in enumerate(c.fetchall()):
+            # Add delay between reconnections to avoid flood
+            await asyncio.sleep(2 + idx * 1)
             await start_account(phone, session)
         
         await event.edit('✅ ПЕРЕЗАПУЩЕНО')
@@ -171,26 +189,48 @@ async def init_bot():
     @bot.on(events.CallbackQuery(data=lambda x: x and x.startswith('keep_')))
     async def keep(event):
         await event.edit('✅ ОСТАВЛЕНО')
-    
-    print('🤖 БОТ ЗАПУЩЕН')
 
 async def run_bot():
+    """Main bot loop"""
     await init_bot()
+    
+    # Load and start all accounts with delays
     c.execute('SELECT phone, session_name FROM accounts')
-    for phone, session in c.fetchall():
-        await start_account(phone, session)
-    await bot.run_until_disconnected()
+    accounts = c.fetchall()
+    
+    for idx, (phone, session) in enumerate(accounts):
+        # Add delay between account starts to prevent flooding
+        await asyncio.sleep(3 + idx * 2)
+        try:
+            await start_account(phone, session)
+        except Exception as e:
+            print(f'Error starting {phone}: {e}')
+    
+    print('🚀 ВСЕ АККАУНТЫ ЗАГРУЖЕНЫ')
+    
+    # Keep bot running
+    if bot:
+        await bot.run_until_disconnected()
 
 def start_bot_thread():
+    """Start bot in separate thread"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    loop.run_until_complete(run_bot())
+    try:
+        loop.run_until_complete(run_bot())
+    except Exception as e:
+        print(f'Bot error: {e}')
+    finally:
+        loop.close()
 
 if __name__ == '__main__':
-    # Start bot in separate thread
+    # Start bot in background thread
     bot_thread = threading.Thread(target=start_bot_thread, daemon=True)
     bot_thread.start()
     
+    # Small delay to let bot start
+    time.sleep(2)
+    
     # Start Flask app
     port = int(os.getenv('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
